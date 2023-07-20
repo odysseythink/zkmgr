@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"mlib.com/mrun"
@@ -84,6 +85,8 @@ type client struct {
 	clientMgr   mrun.ModuleMgr
 	services    map[string]*Service
 	instanceres map[string]*Instancer
+	exitOnce    sync.Once
+	clientEventWatcher
 }
 
 // ACL returns an Option specifying a non-default ACL for creating parent nodes.
@@ -150,9 +153,9 @@ func EventHandler(handler func(zkEvent)) Option {
 // NewClient returns a ZooKeeper client with a connection to the server cluster.
 // It will return an error if the server cluster cannot be resolved.
 func NewClient(servers []string, options ...Option) (Client, error) {
+	log.SetFlags(log.Lmicroseconds | log.Lshortfile)
 	c := &client{}
-	c.clientMgr.Register(c, nil, servers, options)
-	err := c.clientMgr.Init()
+	err := c.Init(servers, options)
 	if err != nil {
 		log.Printf("[E]client init failed:%v\n", err)
 		return nil, err
@@ -209,7 +212,6 @@ func (c *client) Init(args ...interface{}) error {
 				err = c.zkConn.AddAuth("digest", c.clientConfig.credentials)
 				if err != nil {
 					c.zkConn.Close()
-					c.zkConn = nil
 					log.Printf("[E]zkConn.AddAuth failed:%v\n", err)
 					return err
 				}
@@ -219,27 +221,18 @@ func (c *client) Init(args ...interface{}) error {
 
 			// Start listening for incoming Event payloads and callback the set
 			// eventHandler.
+			c.clientMgr.Register(&c.clientEventWatcher, nil, c)
+			err = c.clientMgr.Init()
+			if err != nil {
+				log.Printf("[E]client init failed:%v\n", err)
+				c.zkConn.Close()
+				return err
+			}
 
 			return nil
 		}
 	}
 
-}
-
-func (c *client) RunOnce(ctx context.Context) error {
-	select {
-	case event := <-c.eventc:
-		c.clientConfig.eventHandler(event)
-	default:
-		return nil
-	}
-	return nil
-}
-func (c *client) Destroy() {
-}
-
-func (c *client) UserData() interface{} {
-	return nil
 }
 
 // CreateParentNodes implements the ZooKeeper Client interface.
@@ -255,6 +248,9 @@ func (c *client) CreateParentNodes(path string) error {
 	pathString := ""
 	pathNodes := strings.Split(path, "/")
 	for i := 1; i < len(pathNodes); i++ {
+		if pathNodes[i] == "" {
+			continue
+		}
 		if i <= len(c.rootNodePayload) {
 			payload = c.rootNodePayload[i-1]
 		} else {
@@ -531,12 +527,12 @@ func (c *client) DeleteFullpath(fullpath string) error {
 
 // Stop implements the ZooKeeper Client interface.
 func (c *client) Stop() {
-	if c.zkConn != nil {
-		c.zkConn.Close()
-		c.zkConn = nil
-	}
-	//close(c.quit)
-	log.Printf("[D]...\n")
+	c.exitOnce.Do(func() {
+		if c.zkConn != nil {
+			c.zkConn.Close()
+		}
+	})
+	c.clientMgr.Destroy()
 }
 
 func (c *client) AddInstancer(path string, cb InstancerCallBack, errcb InstancerErrCallBack, childcb ChildCallBack) error {
@@ -560,4 +556,43 @@ func (c *client) StopInstancer(path string) error {
 	c.instanceres[path].Stop()
 	delete(c.instanceres, path)
 	return nil
+}
+
+type clientEventWatcher struct {
+	cli *client
+}
+
+func (w *clientEventWatcher) Init(args ...interface{}) error {
+	if len(args) != 1 {
+		log.Printf("[E] invalid args\n")
+		return errors.New("invalid args")
+	}
+	if cli, ok := args[0].(*client); !ok || cli == nil {
+		log.Printf("[E]args[0] must be client pointer")
+		return errors.New("args[0] must be client pointer")
+	} else {
+		w.cli = cli
+		if w.cli.eventc == nil {
+			log.Printf("[E]client init failed, not have eventc")
+			return errors.New("client init failed, not have eventc")
+		}
+		return nil
+	}
+}
+
+func (w *clientEventWatcher) RunOnce(ctx context.Context) error {
+	select {
+	case event := <-w.cli.eventc:
+		w.cli.clientConfig.eventHandler(event)
+	default:
+		return nil
+	}
+	return nil
+}
+func (w *clientEventWatcher) Destroy() {
+
+}
+
+func (w *clientEventWatcher) UserData() interface{} {
+	return w
 }

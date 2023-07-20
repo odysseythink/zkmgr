@@ -87,10 +87,12 @@ func validatePath(path string, isSequential bool) error {
 		r, width := utf8.DecodeRuneInString(path[i:])
 		switch {
 		case r == '\u0000':
+			log.Printf("[E]path(%s) contains \u0000\n", path)
 			return zkErrInvalidPath
 		case r == '/':
 			last, _ := utf8.DecodeLastRuneInString(path[:i])
 			if last == '/' {
+				log.Printf("[E]path(%s) last contains /\n", path)
 				return zkErrInvalidPath
 			}
 		case r == '.':
@@ -103,11 +105,13 @@ func validatePath(path string, isSequential bool) error {
 
 			if last == '/' {
 				if i+1 == n {
+					log.Printf("[E]path(%s) last contains /\n", path)
 					return zkErrInvalidPath
 				}
 
 				next, _ := utf8.DecodeRuneInString(path[i+w:])
 				if next == '/' {
+					log.Printf("[E]path(%s) last contains /\n", path)
 					return zkErrInvalidPath
 				}
 			}
@@ -115,6 +119,7 @@ func validatePath(path string, isSequential bool) error {
 			r >= '\u007f' && r <= '\u009f',
 			r >= '\uf000' && r <= '\uf8ff',
 			r >= '\ufff0' && r < '\uffff':
+			log.Printf("[E]path(%s) contains invalid char\n", path)
 			return zkErrInvalidPath
 		}
 		w = width
