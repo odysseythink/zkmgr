@@ -83,7 +83,7 @@ type client struct {
 	eventc <-chan zkEvent
 	clientConfig
 	clientMgr   mrun.ModuleMgr
-	services    map[string]*Service
+	services    sync.Map
 	instanceres map[string]*Instancer
 	exitOnce    sync.Once
 	clientEventWatcher
@@ -216,7 +216,6 @@ func (c *client) Init(args ...interface{}) error {
 					return err
 				}
 			}
-			c.services = make(map[string]*Service)
 			c.instanceres = make(map[string]*Instancer)
 
 			// Start listening for incoming Event payloads and callback the set
@@ -244,20 +243,21 @@ func (c *client) CreateParentNodes(path string) error {
 		log.Printf("[E]path(%s) not begin with / charater\n", path)
 		return zkErrInvalidPath
 	}
-	payload := []byte("")
+
 	pathString := ""
 	pathNodes := strings.Split(path, "/")
 	for i := 1; i < len(pathNodes); i++ {
 		if pathNodes[i] == "" {
 			continue
 		}
-		if i <= len(c.rootNodePayload) {
-			payload = c.rootNodePayload[i-1]
-		} else {
-			payload = []byte("")
-		}
 		pathString += "/" + pathNodes[i]
-		_, err := c.Create(pathString, payload, 0, c.acl)
+		var err error
+		if i <= len(c.rootNodePayload) {
+			_, err = c.Create(pathString, c.rootNodePayload[i-1], 0, c.acl)
+		} else {
+			_, err = c.Create(pathString, []byte(""), 0, c.acl)
+		}
+
 		// not being able to create the node because it exists or not having
 		// sufficient rights is not an issue. It is ok for the node to already
 		// exist and/or us to only have read rights
@@ -335,41 +335,58 @@ func (c *client) GetWEntry(path string) (string, <-chan zkEvent, error) {
 }
 
 // Register implements the ZooKeeper Client interface.
-func (c *client) Register(path, name, data string) error {
+func (c *client) Register(path, name, data string) (err error) {
 	log.Printf("[I]zk register(%s/%s) data(%s)\n", path, name, data)
 	if path[len(path)-1] != '/' {
 		path += "/"
 	}
+	var found bool
 	fullpath := path + name
-	if c.services != nil && len(c.services) > 0 {
-		for k, _ := range c.services {
-			if k == fullpath {
-				// already exists
-				found, stat, err := c.Exists(path)
+	c.services.Range(func(key, value any) bool {
+		if strkey, ok := key.(string); !ok && strkey == "" {
+			log.Printf("[E]invalid services key(%#v)\n", key)
+			c.services.Delete(key)
+			return true
+		}
+		if s, ok := value.(*Service); !ok && s == nil {
+			log.Printf("[E]invalid services value(%#v)\n", value)
+			c.services.Delete(key)
+			return true
+		}
+		if key.(string) == fullpath {
+			// already exists
+			var stat *Stat
+			found, stat, err = c.Exists(path)
+			if err != nil {
+				log.Printf("[E]Exists zk node(%s) failed:%v\n", fullpath, err)
+				err = fmt.Errorf("Exists zk node(%s) failed:%v", fullpath, err)
+				return false
+			}
+			if !found {
+				return false
+			} else {
+				_, err = c.Set(fullpath, []byte(data), stat.Version)
 				if err != nil {
-					log.Printf("[E]Exists zk node(%s) failed:%v\n", fullpath, err)
-					return fmt.Errorf("Exists zk node(%s) failed:%v", fullpath, err)
-				}
-				if !found {
-					break
-				} else {
-					_, err := c.Set(fullpath, []byte(data), stat.Version)
-					if err != nil {
-						log.Printf("[E]set zk node(%s) failed:%v\n", fullpath, err)
-						if err := c.Delete(fullpath, stat.Version); err != nil {
-							log.Printf("[E]delete zk node(%s) failed:%v\n", fullpath, err)
-
-						}
-						delete(c.services, fullpath)
-						return fmt.Errorf("set zk node(%s) failed:%v", fullpath, err)
-					} else {
-						log.Printf("[I]success update exists zk node(%s)\n", fullpath)
-						return nil
+					log.Printf("[E]set zk node(%s) failed:%v\n", fullpath, err)
+					if err := c.Delete(fullpath, stat.Version); err != nil {
+						log.Printf("[E]delete zk node(%s) failed:%v\n", fullpath, err)
 					}
+					c.services.Delete(key)
+					err = fmt.Errorf("set zk node(%s) failed:%v", fullpath, err)
+					return false
+				} else {
+					log.Printf("[I]success update exists zk node(%s)\n", fullpath)
+					return false
 				}
-
 			}
 		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
 	}
 
 	s := &Service{
@@ -391,7 +408,7 @@ func (c *client) Register(path, name, data string) error {
 		return fmt.Errorf("CreateProtectedEphemeralSequential zk node(%s) failed:%v", fullpath, err)
 	}
 	s.node = node
-	c.services[fullpath] = s
+	c.services.Store(fullpath, s)
 	return nil
 
 }
@@ -405,35 +422,55 @@ func (c *client) RegisterDirect(path, name, data string) error {
 	if fullpath[len(fullpath)-1] == '/' {
 		fullpath = fullpath[:len(fullpath)-1]
 	}
-	if c.services != nil && len(c.services) > 0 {
-		for k, _ := range c.services {
-			if k == fullpath {
-				// already exists
-				found, stat, err := c.Exists(path)
+
+	var err error
+	var found bool
+	c.services.Range(func(key, value any) bool {
+		if strkey, ok := key.(string); !ok && strkey == "" {
+			log.Printf("[E]invalid services key(%#v)\n", key)
+			c.services.Delete(key)
+			return true
+		}
+		if s, ok := value.(*Service); !ok && s == nil {
+			log.Printf("[E]invalid services value(%#v)\n", value)
+			c.services.Delete(key)
+			return true
+		}
+		if key.(string) == fullpath {
+			// already exists
+			var stat *Stat
+			found, stat, err = c.Exists(path)
+			if err != nil {
+				log.Printf("[E]Exists zk node(%s) failed:%v\n", fullpath, err)
+				err = fmt.Errorf("Exists zk node(%s) failed:%v", fullpath, err)
+				return false
+			}
+			if !found {
+				return false
+			} else {
+				_, err = c.Set(fullpath, []byte(data), stat.Version)
 				if err != nil {
-					log.Printf("[E]Exists zk node(%s) failed:%v\n", fullpath, err)
-					return fmt.Errorf("Exists zk node(%s) failed:%v", fullpath, err)
-				}
-				if !found {
-					break
-				} else {
-					_, err := c.Set(fullpath, []byte(data), stat.Version)
-					if err != nil {
-						log.Printf("[E]set zk node(%s) failed:%v\n", fullpath, err)
-						if err := c.Delete(fullpath, stat.Version); err != nil {
-							log.Printf("[E]delete zk node(%s) failed:%v\n", fullpath, err)
+					log.Printf("[E]set zk node(%s) failed:%v\n", fullpath, err)
+					if err := c.Delete(fullpath, stat.Version); err != nil {
+						log.Printf("[E]delete zk node(%s) failed:%v\n", fullpath, err)
 
-						}
-						delete(c.services, fullpath)
-						return fmt.Errorf("set zk node(%s) failed:%v", fullpath, err)
-					} else {
-						log.Printf("[I]success update exists zk node(%s)\n", fullpath)
-						return nil
 					}
+					c.services.Delete(key)
+					err = fmt.Errorf("set zk node(%s) failed:%v", fullpath, err)
+					return false
+				} else {
+					log.Printf("[I]success update exists zk node(%s)\n", fullpath)
+					return false
 				}
-
 			}
 		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
 	}
 
 	s := &Service{
@@ -455,7 +492,7 @@ func (c *client) RegisterDirect(path, name, data string) error {
 		return err
 	}
 	s.node = node
-	c.services[fullpath] = s
+	c.services.Store(fullpath, s)
 	return nil
 }
 
@@ -468,13 +505,21 @@ func (c *client) Deregister(path, name string) error {
 	if fullpath[len(fullpath)-1] == '/' {
 		fullpath = fullpath[:len(fullpath)-1]
 	}
-	if len(c.services) == 0 {
-		log.Printf("[E]no services register\n")
-		return fmt.Errorf("no services register")
-	}
-	if _, ok := c.services[fullpath]; !ok {
+
+	if val, ok := c.services.Load(fullpath); !ok {
 		log.Printf("[E]this service(%s) not register\n", fullpath)
 		return fmt.Errorf("this service(%s) not register", fullpath)
+	} else {
+		if val == nil {
+			log.Printf("[E]this service(%s) register empty service\n", fullpath)
+			c.services.Delete(fullpath)
+			return fmt.Errorf("this service(%s) register empty service", fullpath)
+		}
+		if s, ok := val.(*Service); !ok && s == nil {
+			log.Printf("[E]this service(%s) register not a service\n", fullpath)
+			c.services.Delete(fullpath)
+			return fmt.Errorf("this service(%s) register not a service", fullpath)
+		}
 	}
 
 	found, stat, err := c.Exists(fullpath)
@@ -490,7 +535,7 @@ func (c *client) Deregister(path, name string) error {
 		log.Printf("[E]service(%s) node Delete failed:%v\n", fullpath, err)
 		return fmt.Errorf("service(%s) node Delete failed:%v", fullpath, err)
 	}
-	delete(c.services, fullpath)
+	c.services.Delete(fullpath)
 	return nil
 }
 
@@ -499,13 +544,21 @@ func (c *client) DeleteFullpath(fullpath string) error {
 	if fullpath[len(fullpath)-1] == '/' {
 		fullpath = fullpath[:len(fullpath)-1]
 	}
-	if len(c.services) == 0 {
-		log.Printf("[E]no services register\n")
-		return fmt.Errorf("no services register")
-	}
-	if _, ok := c.services[fullpath]; !ok {
+
+	if val, ok := c.services.Load(fullpath); !ok {
 		log.Printf("[E]this service(%s) not register\n", fullpath)
 		return fmt.Errorf("this service(%s) not register", fullpath)
+	} else {
+		if val == nil {
+			log.Printf("[E]this service(%s) register empty service\n", fullpath)
+			c.services.Delete(fullpath)
+			return fmt.Errorf("this service(%s) register empty service", fullpath)
+		}
+		if s, ok := val.(*Service); !ok && s == nil {
+			log.Printf("[E]this service(%s) register not a service\n", fullpath)
+			c.services.Delete(fullpath)
+			return fmt.Errorf("this service(%s) register not a service", fullpath)
+		}
 	}
 
 	found, stat, err := c.Exists(fullpath)
@@ -521,7 +574,7 @@ func (c *client) DeleteFullpath(fullpath string) error {
 		log.Printf("[E]service(%s) node Delete failed:%v\n", fullpath, err)
 		return fmt.Errorf("service(%s) node Delete failed:%v", fullpath, err)
 	}
-	delete(c.services, fullpath)
+	c.services.Delete(fullpath)
 	return nil
 }
 
@@ -529,6 +582,33 @@ func (c *client) DeleteFullpath(fullpath string) error {
 func (c *client) Stop() {
 	c.exitOnce.Do(func() {
 		if c.zkConn != nil {
+			c.services.Range(func(key, value any) bool {
+				if strkey, ok := key.(string); !ok && strkey == "" {
+					log.Printf("[E]invalid services key(%#v)\n", key)
+					c.services.Delete(key)
+					return true
+				}
+				if s, ok := value.(*Service); !ok && s == nil {
+					log.Printf("[E]invalid services value(%#v)\n", value)
+					c.services.Delete(key)
+					return true
+				}
+				found, stat, err := c.Exists(key.(string))
+				if err != nil {
+					log.Printf("[E]get service(%s) exists failed:%v\n", key.(string), err)
+				} else {
+					if !found {
+						log.Printf("[E]service(%s) node not exists\n", key.(string))
+					} else {
+						if err := c.Delete(key.(string), stat.Version); err != nil {
+							log.Printf("[E]service(%s) node Delete failed:%v\n", key.(string), err)
+						}
+					}
+				}
+				c.services.Delete(key.(string))
+				return true
+			})
+
 			c.zkConn.Close()
 		}
 	})
